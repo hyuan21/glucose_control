@@ -100,7 +100,14 @@ class td3_bc:
         self.noise_clip = 0.5
         self.policy_freq = 2
         self.alpha = 2.5
-        
+
+        # Optional reward normalisation (思路 3). When enabled, get_batch
+        # rescales rewards to zero-mean / unit-std using buffer statistics,
+        # which keeps |Q| in a D4RL-like range and restores the BC vs Q
+        # balance that paper alpha=2.5 was tuned for. Off by default so
+        # the published baseline numbers stay reproducible.
+        self.normalize_reward = params.get("normalize_reward", False)
+
         # DISPLAY
         self.pid_bg, self.pid_insulin, self.pid_action, self.pid_reward  = [], [], [], 0
         self.training_timesteps = params["training_timesteps"]
@@ -180,15 +187,25 @@ class td3_bc:
         # Process the replay --------------------------------------------------
         
         # unpackage the replay
-        self.memory, self.state_mean, self.state_std, self.action_mean, self.action_std, _, _ = unpackage_replay(
+        (
+            self.memory, self.state_mean, self.state_std,
+            self.action_mean, self.action_std,
+            reward_mean, reward_std,
+        ) = unpackage_replay(
             trajectories=trajectories, empty_replay=self.memory, data_processing=self.data_processing, sequence_length=self.sequence_length
         )
-        
+
         # update the parameters
         self.action_std = 1.75 * self.bas * 0.25 / (self.action_std / self.bas)
         self.params["state_mean"], self.params["state_std"]  = self.state_mean, self.state_std
-        self.params["action_mean"], self.params["action_std"] = self.action_mean, self.action_std    
+        self.params["action_mean"], self.params["action_std"] = self.action_mean, self.action_std
         self.max_action = float(((self.bas * 3.0) - self.action_mean) / self.action_std)
+
+        # 思路 3 reward normalisation (opt-in).
+        if self.normalize_reward:
+            self.params["reward_mean"] = float(reward_mean)
+            self.params["reward_std"]  = float(reward_std)
+            print(f"[normalize_reward] mean={reward_mean:.4f}  std={reward_std:.4f}")
         
         # initialise the networks
         self.init_model()

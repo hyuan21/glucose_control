@@ -230,9 +230,15 @@ def get_batch(replay, batch_size, data_processing="condensed", sequence_length=8
     reward_to_go = torch.FloatTensor(reward_to_go / reward_scale).to(device)
     timestep = torch.tensor(timestep, dtype=torch.int32).to(device)
     
-    # get norm of reward
-    if reward_mean: reward = torch.FloatTensor(reward_scale * (reward - reward_mean) / reward_std).to(device)
-    else: reward = torch.FloatTensor(reward).to(device)
+    # get norm of reward.
+    # Old check `if reward_mean:` silently fails when reward_mean is 0
+    # (Python truthiness) -- we now check `is not None` so the legacy
+    # behaviour (raw reward) is recovered only when no normalisation
+    # stats are present in params.
+    if reward_mean is not None and reward_std is not None:
+        reward = torch.FloatTensor(reward_scale * (reward - reward_mean) / reward_std).to(device)
+    else:
+        reward = torch.FloatTensor(reward).to(device)
     
     if hidden_in[0] is not None and online:
         

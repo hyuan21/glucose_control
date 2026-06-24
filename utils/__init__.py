@@ -6,7 +6,8 @@ Created on Sat Apr  2 14:02:57 2022
 """
 
 from .general import calculate_bolus, calculate_risk, is_in_range, PID_action
-from .parameters import create_env, get_params
+from .parameters import (create_env, get_params, set_env_sample_time,
+                         SAMPLE_TIME_TO_SENSOR, RECOMMENDED_SAMPLE_TIMES)
 from .data_collection import fill_replay, fill_replay_split
 from .data_processing import unpackage_replay, get_batch
 from .evaluation import test_algorithm, create_graph

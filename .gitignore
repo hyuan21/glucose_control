@@ -179,3 +179,6 @@ Replays/
 Thumbs.db
 .vscode/
 .idea/
+*.aux
+*.out
+*.synctex.gz

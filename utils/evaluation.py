@@ -20,10 +20,32 @@ Test the learned policy of an agent against the PID algorithm over a
 specified length of time.
 """
 def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length=80,
-                   data_processing="condensed", pid_run=False, lstm=False, params=None):
-    
+                   data_processing="condensed", pid_run=False, lstm=False, params=None,
+                   sample_time=None):
+    """
+    sample_time : CGM sampling interval in minutes (Δt). If None, falls back to
+        params["sample_time"] and finally to 3.0 (the original Dexcom default).
+
+    NOTE on multi-Δt testing (professor's directive, 2026-06):
+    The policy was trained with a fixed 11-D condensed state built on a 3-min
+    grid. To test the SAME policy under a different sampling interval, we keep
+    the policy's input interface untouched and rebuild a same-shaped state on
+    the real-time grid implied by `sample_time`. Any TIR change therefore comes
+    from sampling-rate mismatch (what we want to measure), not from feeding the
+    network a wrong-shaped state. All hard-coded "3"s below are now `dt`.
+    """
+
+    # Sampling interval (Δt) -------------------------------------------------
+    if sample_time is None:
+        sample_time = params.get("sample_time", 3.0)
+    dt = float(sample_time)
+
+    # Number of CGM samples per hour and per day on this Δt grid
+    samples_per_day = int(round(24 * 60 / dt))      # 480 at dt=3
+    time_norm = samples_per_day - 1                 # 479 at dt=3 (the old magic number)
+
     # Diabetes
-    basal_default = params.get("basal_default") 
+    basal_default = params.get("basal_default")
     target_blood_glucose = params.get("target_blood_glucose", 144)
     
     # Bolus
@@ -74,21 +96,21 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
         # get the state
         insulin_dose = 1/3 * basal_default
         meal, done, bg_val = 0, False, env.reset()
-        time = ((env.env.time.hour * 60) / 3 + env.env.time.minute / 3) / 479
+        time = ((env.env.time.hour * 60) / dt + env.env.time.minute / dt) / time_norm
         state = np.array([bg_val[0], meal, insulin_dose, time], dtype=np.float32)
         last_action = insulin_dose
 
         # get a suitable input
         state_stack = np.tile(state, (sequence_length + 1, 1))
-        state_stack[:, 3] = (state_stack[:, 3] - np.arange(((sequence_length + 1) / 479), 0, -(1 / 479))[:sequence_length + 1]) * 479            
-        state_stack[:, 3] = (np.around(state_stack[:, 3], 0) % 480) / 479         
+        state_stack[:, 3] = (state_stack[:, 3] - np.arange(((sequence_length + 1) / time_norm), 0, -(1 / time_norm))[:sequence_length + 1]) * time_norm
+        state_stack[:, 3] = (np.around(state_stack[:, 3], 0) % samples_per_day) / time_norm
 
         # get the action and reward stack
-        action_stack = np.tile(np.array([insulin_dose], dtype=np.float32), (sequence_length + 1, 1))        
+        action_stack = np.tile(np.array([insulin_dose], dtype=np.float32), (sequence_length + 1, 1))
         reward_stack = np.tile(-calculate_risk(bg_val), (sequence_length + 1, 1))
 
-        # get the meal history
-        meal_history = np.zeros(int((3 * 60) / 3), dtype=np.float32)
+        # get the meal history (last 3 hours, in steps of Δt)
+        meal_history = np.zeros(int((3 * 60) / dt), dtype=np.float32)
         
         # intiialise pid parameters
         integrated_state = 0
@@ -118,16 +140,33 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
                 
                 # condense the state
                 if data_processing == "condensed":
-                                    
-                    # Unpack the state
-                    bg_vals, meal_vals, insulin_vals = state_stack[:, 0][::10], state_stack[:, 1], state_stack[:, 2]
-                    
+
+                    # Unpack the BG history. Original code used a fixed stride of
+                    # 10 over an 81-long stack -> 9 snapshots spaced 10 steps
+                    # (=30 real-min at Δt=3) apart. To keep the SAME 9-D BG
+                    # history in REAL TIME under any Δt, the stride scales with
+                    # 3/dt so the 9 snapshots always cover the same ~4h window
+                    # the policy was trained on. We then take exactly 9 values.
+                    base_stride = 10                       # original stride at dt=3
+                    stride = max(1, int(round(base_stride * 3.0 / dt)))
+                    bg_vals = state_stack[:, 0][::stride]
+                    n_bg = (sequence_length // base_stride) + 1   # = 9, matches training input dim
+                    if len(bg_vals) >= n_bg:
+                        bg_vals = bg_vals[:n_bg]
+                    else:
+                        # pad with the oldest available snapshot if Δt > 3 leaves
+                        # fewer samples in the window (keeps input dim fixed at 9)
+                        pad = np.full(n_bg - len(bg_vals), bg_vals[-1], dtype=bg_vals.dtype)
+                        bg_vals = np.concatenate([bg_vals, pad])
+
+                    meal_vals, insulin_vals = state_stack[:, 1], state_stack[:, 2]
+
                     # calculate insulin and meals on board
                     decay_factor = np.arange(1 / (sequence_length + 2), 1, 1 / (sequence_length + 2))
-                    meals_on_board, insulin_on_board = np.sum(meal_vals * decay_factor), np.sum(insulin_vals * decay_factor) 
-                    
+                    meals_on_board, insulin_on_board = np.sum(meal_vals * decay_factor), np.sum(insulin_vals * decay_factor)
+
                     # create the state
-                    state = np.concatenate([bg_vals, meals_on_board.reshape(1), insulin_on_board.reshape(1)])  
+                    state = np.concatenate([bg_vals, meals_on_board.reshape(1), insulin_on_board.reshape(1)])
                     prev_action = last_action
                     
                 # TOOD: replace with explicity state and action size
@@ -214,8 +253,8 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
                     index = meal_scenario["time"].index(future_time)
                     future_meal = meal_scenario["amount"][index] 
                     
-                meal_input = future_meal/3
-            
+                meal_input = future_meal/dt
+
             # add missing data to the dataset
             rand = np.random.rand()
             if (rand < missing_data_prob) or (missing_period > 0):
@@ -239,8 +278,8 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
             compression_period -= 1
             
             # get the rnn array format for state
-            time = ((env.env.time.hour * 60) / 3 + env.env.time.minute / 3)/479
-            next_state = np.array([float(next_bg_val[0]), float(meal_input), float(chosen_action), time], dtype=np.float32)   
+            time = ((env.env.time.hour * 60) / dt + env.env.time.minute / dt)/time_norm
+            next_state = np.array([float(next_bg_val[0]), float(meal_input), float(chosen_action), time], dtype=np.float32)
 
             # update the state stacks
             next_state_stack = np.delete(state_stack, 0, 0)
@@ -292,12 +331,17 @@ and RL algorithm, showing the blood glucose, insulin doses and meal
 carbohyrdates.
 """
 def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
-                 pid_reward, pid_blood_glucose, pid_action, params):
-    
+                 pid_reward, pid_blood_glucose, pid_action, params, sample_time=None):
+
     # Unpack the params
-    
+
+    # Sampling interval (Δt) — used to convert step counts to minutes
+    if sample_time is None:
+        sample_time = params.get("sample_time", 3.0)
+    dt = float(sample_time)
+
     # Diabetes
-    basal_default = params.get("basal_default")    
+    basal_default = params.get("basal_default")
     hyper_threshold = params.get("hyper_threshold", 180) 
     sig_hyper_threshold = params.get("sig_hyper_threshold", 250)
     hypo_threshold = params.get("hypo_threshold ", 70)
@@ -381,7 +425,7 @@ def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
                 
             # reset the count
             else:
-                pid_hyper_length.append(hyper_count * 3)
+                pid_hyper_length.append(hyper_count * dt)
                 hyper_count = 0
                 
         # if continued hypo
@@ -393,7 +437,7 @@ def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
                 
             # reset the count
             else:
-                pid_hypo_length.append(hypo_count * 3)
+                pid_hypo_length.append(hypo_count * dt)
                 hypo_count = 0
                 
         prev_classification = classification
@@ -416,7 +460,7 @@ def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
                 
             # reset the count
             else:
-                rl_hyper_length.append(hyper_count * 3)
+                rl_hyper_length.append(hyper_count * dt)
                 hyper_count = 0
                 
         # if continued hypo
@@ -428,7 +472,7 @@ def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
                 
             # reset the count
             else:
-                rl_hypo_length.append(hypo_count * 3)
+                rl_hypo_length.append(hypo_count * dt)
                 hypo_count = 0
                 
         prev_classification = classification
@@ -486,7 +530,7 @@ def create_graph(rl_reward, rl_blood_glucose, rl_action, rl_insulin, rl_meals,
         axs[0].axis(ymin=50, ymax=500)
         axs[0].axis(xmin=0.0, xmax=len(pid_blood_glucose))
         axs[0].set_ylabel("BG \n(mg/dL)")
-        axs[0].set_xlabel("Time \n(mins)")
+        axs[0].set_xlabel("Time \n(steps, Δt={}min)".format(dt))
         
         # show the basal doses
         axs[1].plot(x, pid_action, label='pid', color='orange')

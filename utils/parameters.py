@@ -846,9 +846,88 @@ def get_params():
             "replay_name" : "Adult#10-1e5"
         
         },
-        
-        
-    
+
+
+
     }
-    
+
     return params
+
+
+# =====================================================================
+# Multi-dt testing support (professor's directive, 2026-06)
+# ---------------------------------------------------------------------
+# simglucose's sampling interval (dt) is entirely determined by the CGM
+# sensor: the env sets sample_time = sensor.sample_time. The hemerson1
+# fork's gym wrapper hard-codes SENSOR_HARDWARE='Dexcom' (3 min), so we
+# cannot pass a sensor through gym registration. Instead we swap the
+# sensor on the *already constructed* env. Touches no third-party source.
+#
+# Three real CGM devices natively cover the range we want, so no fake
+# sensor parameters are needed:
+#     Navigator  -> 1.0 min
+#     Dexcom     -> 3.0 min  (training dt; default / anchor)
+#     GuardianRT -> 5.0 min
+# =====================================================================
+
+# Map a desired sampling interval (minutes) to a real simglucose sensor.
+SAMPLE_TIME_TO_SENSOR = {
+    1.0: "Navigator",
+    3.0: "Dexcom",
+    5.0: "GuardianRT",
+}
+
+# Recommended test grid. 3 min is the training anchor; 1 and 5 min
+# bracket it with real devices.
+RECOMMENDED_SAMPLE_TIMES = [1.0, 3.0, 5.0]
+
+
+def _find_attr_holder(env, attr, max_depth=8):
+    """Walk down .env wrappers until we reach the object that owns `attr`.
+    Robust to however many gym wrappers sit on top."""
+    cur = env
+    for _ in range(max_depth):
+        if hasattr(cur, attr):
+            return cur
+        if hasattr(cur, "env"):
+            cur = cur.env
+        else:
+            break
+    raise AttributeError("Could not locate an env owning attribute %r." % attr)
+
+
+def _find_sim_env(env):
+    """Return the inner simulation env (the object owning `sensor`)."""
+    return _find_attr_holder(env, "sensor")
+
+
+def set_env_sample_time(env, sample_time):
+    """Make a constructed env sample every `sample_time` minutes.
+
+    IMPORTANT: the hemerson1 gym wrapper rebuilds its entire inner sim env
+    on every reset()/seed() via `_create_env_from_random_state`, which reads
+    `self.SENSOR_HARDWARE` and ALWAYS constructs a Dexcom sensor. So simply
+    replacing `sim.sensor` then calling reset() gets clobbered. The reliable
+    fix is to override SENSOR_HARDWARE on the wrapper *instance* so every
+    rebuild uses the sensor we want; we then reset to apply it.
+
+    Returns the actual sample_time now in force (float).
+    """
+    sample_time = float(sample_time)
+    if sample_time not in SAMPLE_TIME_TO_SENSOR:
+        raise ValueError(
+            "No real CGM sensor for dt={} min. Available: {}. (To use a "
+            "custom dt, add a row to simglucose's sensor_params.csv.)".format(
+                sample_time, sorted(SAMPLE_TIME_TO_SENSOR)))
+
+    sensor_name = SAMPLE_TIME_TO_SENSOR[sample_time]
+
+    # The wrapper that owns SENSOR_HARDWARE is the one that rebuilds the sim.
+    wrapper = _find_attr_holder(env, "SENSOR_HARDWARE")
+    wrapper.SENSOR_HARDWARE = sensor_name      # shadows the class default
+
+    # Reset so the rebuild constructs the chosen sensor; then read back.
+    env.reset()
+    sim = _find_sim_env(env)
+    actual = getattr(sim, "sample_time", sim.sensor.sample_time)
+    return float(actual)
