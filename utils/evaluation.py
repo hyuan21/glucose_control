@@ -44,6 +44,15 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
     samples_per_day = int(round(24 * 60 / dt))      # 480 at dt=3
     time_norm = samples_per_day - 1                 # 479 at dt=3 (the old magic number)
 
+    # The condensed TD3-BC state was trained with 80 Dexcom samples at 3 min,
+    # i.e. a 240-min real-time history. When testing at another sample time,
+    # keep the same real-time window instead of the same number of samples.
+    # Otherwise dt=1 would only see 80 min of history and dt=5 would see 400 min.
+    if data_processing == "condensed":
+        history_length = int(round(sequence_length * 3.0 / dt))
+    else:
+        history_length = sequence_length
+
     # Diabetes
     basal_default = params.get("basal_default")
     target_blood_glucose = params.get("target_blood_glucose", 144)
@@ -101,13 +110,13 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
         last_action = insulin_dose
 
         # get a suitable input
-        state_stack = np.tile(state, (sequence_length + 1, 1))
-        state_stack[:, 3] = (state_stack[:, 3] - np.arange(((sequence_length + 1) / time_norm), 0, -(1 / time_norm))[:sequence_length + 1]) * time_norm
+        state_stack = np.tile(state, (history_length + 1, 1))
+        state_stack[:, 3] = (state_stack[:, 3] - np.arange(((history_length + 1) / time_norm), 0, -(1 / time_norm))[:history_length + 1]) * time_norm
         state_stack[:, 3] = (np.around(state_stack[:, 3], 0) % samples_per_day) / time_norm
 
         # get the action and reward stack
-        action_stack = np.tile(np.array([insulin_dose], dtype=np.float32), (sequence_length + 1, 1))
-        reward_stack = np.tile(-calculate_risk(bg_val), (sequence_length + 1, 1))
+        action_stack = np.tile(np.array([insulin_dose], dtype=np.float32), (history_length + 1, 1))
+        reward_stack = np.tile(-calculate_risk(bg_val), (history_length + 1, 1))
 
         # get the meal history (last 3 hours, in steps of Δt)
         meal_history = np.zeros(int((3 * 60) / dt), dtype=np.float32)
@@ -141,29 +150,28 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
                 # condense the state
                 if data_processing == "condensed":
 
-                    # Unpack the BG history. Original code used a fixed stride of
-                    # 10 over an 81-long stack -> 9 snapshots spaced 10 steps
-                    # (=30 real-min at Δt=3) apart. To keep the SAME 9-D BG
-                    # history in REAL TIME under any Δt, the stride scales with
-                    # 3/dt so the 9 snapshots always cover the same ~4h window
-                    # the policy was trained on. We then take exactly 9 values.
-                    base_stride = 10                       # original stride at dt=3
-                    stride = max(1, int(round(base_stride * 3.0 / dt)))
-                    bg_vals = state_stack[:, 0][::stride]
-                    n_bg = (sequence_length // base_stride) + 1   # = 9, matches training input dim
-                    if len(bg_vals) >= n_bg:
-                        bg_vals = bg_vals[:n_bg]
-                    else:
-                        # pad with the oldest available snapshot if Δt > 3 leaves
-                        # fewer samples in the window (keeps input dim fixed at 9)
-                        pad = np.full(n_bg - len(bg_vals), bg_vals[-1], dtype=bg_vals.dtype)
-                        bg_vals = np.concatenate([bg_vals, pad])
+                    # Original training used 9 BG snapshots from 4h ago to now,
+                    # spaced every 30 real minutes. Keep those real-time lags
+                    # under each test Δt.
+                    n_bg = 9
+                    bg_indices = np.round(np.linspace(0, history_length, n_bg)).astype(int)
+                    bg_vals = state_stack[:, 0][bg_indices]
 
                     meal_vals, insulin_vals = state_stack[:, 1], state_stack[:, 2]
 
-                    # calculate insulin and meals on board
-                    decay_factor = np.arange(1 / (sequence_length + 2), 1, 1 / (sequence_length + 2))
-                    meals_on_board, insulin_on_board = np.sum(meal_vals * decay_factor), np.sum(insulin_vals * decay_factor)
+                    # Calculate insulin and meals on board.
+                    #
+                    # The actor was trained on an 80-step, 3-min condensed
+                    # state. In multi-dt testing we change history_length to
+                    # keep the same 240-min real-time window, but a direct sum
+                    # would make constant-rate IOB/MOB roughly 3x larger at
+                    # dt=1 and too small at dt=5. Multiplying by dt / 3 keeps
+                    # these integral-like features on the original training
+                    # scale while preserving the 4-hour real-time window.
+                    decay_factor = np.arange(1 / (history_length + 2), 1, 1 / (history_length + 2))
+                    on_board_scale = dt / 3.0
+                    meals_on_board = np.sum(meal_vals * decay_factor) * on_board_scale
+                    insulin_on_board = np.sum(insulin_vals * decay_factor) * on_board_scale
 
                     # create the state
                     state = np.concatenate([bg_vals, meals_on_board.reshape(1), insulin_on_board.reshape(1)])
@@ -223,6 +231,11 @@ def test_algorithm(env, agent_action, seed=0, max_timesteps=480, sequence_length
                     correction_factor=cf, 
                     target_blood_glucose=target_blood_glucose
                     ) 
+                # calculate_bolus was written for the original 3-min Dexcom
+                # step and returns a rate that delivers the bolus over 3 min.
+                # Under multi-Δt testing, keep the total meal bolus invariant
+                # by converting that rate to the current action interval.
+                bolus_action *= 3.0 / dt
                                        
                 chosen_action = float(chosen_action) + bolus_action
                 

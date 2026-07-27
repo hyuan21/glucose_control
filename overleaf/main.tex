@@ -1,0 +1,311 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{Complete PhiBE-TD3-BC for Continuous-Time Glucose Control}
+\author{Hanzhang Yuan}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report summarizes the current progress of a continuous-time offline reinforcement
+learning project for type 1 diabetes glucose control. The project starts from the TD3-BC
+offline RL baseline in Emerson et al. and adds a physics-informed Bellman equation
+(PhiBE) regularization term motivated by the continuous-time Hamilton--Jacobi--Bellman
+(HJB) equation. The main methodological update is a complete second-order PhiBE loss
+that includes the full Hessian/diffusion contribution, rather than only a first-order drift
+term or a diagonal approximation. Experiments are performed on the adult\#1 virtual
+patient with training data collected at the original 3-minute interval and evaluation at
+1, 3, and 5 minute sampling intervals. The current best stable Complete PhiBE setting is
+\(\lambda_{\mathrm{PhiBE}}=0.01\), \(\alpha=1.25\), and 70k training updates. This setting
+improves time in range across all tested sampling intervals, but slightly increases time
+below range, suggesting that the next research direction should focus on preserving the
+TIR improvement while controlling hypoglycemia risk.
+\end{abstract}
+
+\section{Background and Objective}
+
+The baseline project follows the offline RL glucose-control framework of Emerson et al.,
+where a policy is trained from a fixed replay buffer rather than by interacting with a
+patient online. This is important for glucose control because unsafe online exploration
+can lead to clinically undesirable insulin dosing.
+
+The current project investigates whether the TD3-BC baseline can be improved by using
+continuous-time structure. Instead of treating glucose control only as a discrete-time
+Bellman learning problem, we regularize the critic using a residual inspired by the
+continuous-time HJB equation. The research question is:
+
+\begin{quote}
+Can a continuous-time PhiBE regularizer improve glucose-control performance under
+different evaluation sampling intervals while maintaining acceptable hypoglycemia risk?
+\end{quote}
+
+\section{Baseline: TD3-BC}
+
+TD3-BC trains an actor \(\pi_\phi(s)\) and two critics \(Q_{\theta_1}(s,a)\),
+\(Q_{\theta_2}(s,a)\). For a batch transition
+\((s_i,a_i,r_i,s'_i)\), the TD target is
+\begin{equation}
+y_i
+= r_i
++ \gamma
+\min_{j=1,2}
+Q_{\bar{\theta}_j}
+\left(
+s'_i,
+\pi_{\bar{\phi}}(s'_i) + \epsilon
+\right),
+\end{equation}
+where \(\epsilon\) is clipped target-policy smoothing noise. The critic loss is
+\begin{equation}
+\mathcal{L}_{\mathrm{TD}}
+=
+\frac{1}{B}
+\sum_{i=1}^{B}
+\left[
+\left(Q_{\theta_1}(s_i,a_i)-y_i\right)^2
++
+\left(Q_{\theta_2}(s_i,a_i)-y_i\right)^2
+\right].
+\end{equation}
+
+The TD3-BC actor objective balances value maximization and behavioral cloning:
+\begin{equation}
+\mathcal{L}_{\pi}
+=
+-
+\frac{\alpha}
+{\frac{1}{B}\sum_{i=1}^{B}\left|Q_{\theta_1}(s_i,\pi_\phi(s_i))\right|}
+\cdot
+\frac{1}{B}\sum_{i=1}^{B} Q_{\theta_1}(s_i,\pi_\phi(s_i))
++
+\frac{1}{B}\sum_{i=1}^{B}
+\left\|\pi_\phi(s_i)-a_i\right\|_2^2.
+\end{equation}
+Here, \(\alpha\) controls how strongly the actor follows the critic value term relative
+to the behavior-cloning term.
+
+\section{Continuous-Time PhiBE Formulation}
+
+We model the underlying glucose dynamics as a stochastic differential equation:
+\begin{equation}
+d s_t
+= b(s_t,a_t)\,dt
++ \sigma(s_t,a_t)\,dW_t,
+\end{equation}
+where \(b(s_t,a_t)\) is the drift term, \(\sigma(s_t,a_t)\) is the diffusion term, and
+\(W_t\) is Brownian motion.
+
+The corresponding continuous-time optimal-control equation is the HJB equation:
+\begin{equation}
+\beta V^\star(s)
+=
+\max_a
+\left[
+r(s,a)
++
+b(s,a)^\top \nabla_s V^\star(s)
++
+\frac{1}{2}
+\sigma(s,a)\sigma(s,a)^\top
+:
+\nabla_s^2 V^\star(s)
+\right].
+\end{equation}
+
+In implementation, the critic \(Q_\theta(s,a)\) is used as the value-like function.
+For each replay transition, define
+\begin{equation}
+\Delta s_i = s'_i - s_i,
+\qquad
+\Delta t = 3 \ \mathrm{min}.
+\end{equation}
+The empirical drift is approximated as
+\begin{equation}
+\hat{b}_i = \frac{\Delta s_i}{\Delta t}.
+\end{equation}
+
+The Complete PhiBE residual is
+\begin{equation}
+\mathcal{R}_{\theta}(s_i,a_i)
+=
+\beta Q_{\theta}(s_i,a_i)
+- r_i
+- \nabla_s Q_{\theta}(s_i,a_i)^\top \hat{b}_i
+- \frac{1}{2\Delta t}
+\Delta s_i^\top
+\nabla_s^2 Q_{\theta}(s_i,a_i)
+\Delta s_i .
+\end{equation}
+
+The last term is the full Hessian/diffusion term. It includes cross-state curvature
+effects through the quadratic form
+\begin{equation}
+\Delta s_i^\top
+\nabla_s^2 Q_{\theta}(s_i,a_i)
+\Delta s_i.
+\end{equation}
+The implementation computes this quantity using a Hessian-vector product, so it does not
+explicitly materialize a full Hessian matrix for every batch sample.
+
+The PhiBE regularization loss is
+\begin{equation}
+\mathcal{L}_{\mathrm{PhiBE}}
+=
+\frac{1}{B}
+\sum_{i=1}^{B}
+\left[
+\mathcal{R}_{\theta_1}(s_i,a_i)^2
++
+\mathcal{R}_{\theta_2}(s_i,a_i)^2
+\right].
+\end{equation}
+
+The final critic objective is
+\begin{equation}
+\mathcal{L}_{\mathrm{critic}}
+=
+\mathcal{L}_{\mathrm{TD}}
++
+\lambda_{\mathrm{PhiBE}}
+\mathcal{L}_{\mathrm{PhiBE}}.
+\end{equation}
+
+\section{Experimental Setup}
+
+The current experiments use adult\#1 from the simulator. The replay buffer is collected
+with the original 3-minute setting used by the baseline protocol. To avoid confounding the
+comparison, the training replay construction is kept fixed at 3 minutes. The trained policy
+is then evaluated under multiple continuous-time testing intervals:
+\[
+\Delta t \in \{1,3,5\} \ \mathrm{min}.
+\]
+
+The main metrics are:
+\begin{itemize}
+\item Time in range (TIR): percentage of glucose values in 70--180 mg/dl.
+\item Time below range (TBR): percentage of glucose values below 70 mg/dl.
+\item Time above range (TAR): percentage of glucose values above 180 mg/dl.
+\item Mean blood glucose (Mean BG).
+\item Mean insulin action.
+\end{itemize}
+
+\section{Current Results}
+
+The current best stable Complete PhiBE configuration is
+\[
+\lambda_{\mathrm{PhiBE}}=0.01,
+\qquad
+\alpha=1.25,
+\qquad
+\mathrm{training\ updates}=70{,}000.
+\]
+
+\begin{table}[h]
+\centering
+\caption{Adult\#1 multi-\(\Delta t\) evaluation.}
+\label{tab:main_results}
+\begin{tabular}{llrrrrr}
+\toprule
+Method & \(\Delta t\) & \(N\) & TIR & TBR & TAR & Mean BG \\
+\midrule
+TD3-BC & 1 min & 9 & 88.71\% & 2.56\% & 8.73\% & 131.7 \\
+PID & 1 min & 3 & 85.64\% & 2.00\% & 12.36\% & 137.0 \\
+Complete PhiBE & 1 min & 9 & 89.06\% & 4.51\% & 6.43\% & 125.3 \\
+\midrule
+TD3-BC & 3 min & 9 & 69.26\% & 0.07\% & 30.66\% & 156.8 \\
+PID & 3 min & 3 & 61.04\% & 0.04\% & 38.92\% & 164.5 \\
+Complete PhiBE & 3 min & 9 & 71.98\% & 0.21\% & 27.81\% & 153.1 \\
+\midrule
+TD3-BC & 5 min & 9 & 62.29\% & 0.05\% & 37.66\% & 164.9 \\
+PID & 5 min & 3 & 53.19\% & 0.00\% & 46.81\% & 174.1 \\
+Complete PhiBE & 5 min & 9 & 65.22\% & 0.09\% & 34.68\% & 161.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Alpha Sensitivity and Stability}
+
+The first Complete PhiBE setting tested was \(\alpha=1.75\). It improved TIR at 3 and
+5 minutes, but one training seed became too aggressive and produced high TBR at 1 minute.
+To understand this tradeoff, smaller actor weights were evaluated.
+
+\begin{table}[h]
+\centering
+\caption{Seed-1 alpha sensitivity for Complete PhiBE.}
+\label{tab:alpha_sweep}
+\begin{tabular}{lrrrrr}
+\toprule
+Setting & \(\Delta t\) & TIR & TBR & TAR & Mean BG \\
+\midrule
+\(\alpha=1.25\) & 1 min & 88.74\% & 6.59\% & 4.66\% & 120.0 \\
+\(\alpha=1.25\) & 3 min & 75.44\% & 0.38\% & 24.18\% & 148.7 \\
+\(\alpha=1.25\) & 5 min & 70.46\% & 0.20\% & 29.34\% & 154.8 \\
+\midrule
+\(\alpha=1.30\) & 1 min & 89.52\% & 5.31\% & 5.16\% & 122.1 \\
+\(\alpha=1.30\) & 3 min & 73.96\% & 0.40\% & 25.65\% & 150.3 \\
+\(\alpha=1.30\) & 5 min & 69.86\% & 0.12\% & 30.02\% & 155.9 \\
+\midrule
+\(\alpha=1.50\) & 1 min & 77.34\% & 20.30\% & 2.36\% & 102.3 \\
+\(\alpha=1.50\) & 3 min & 79.21\% & 2.40\% & 18.40\% & 140.1 \\
+\(\alpha=1.50\) & 5 min & 75.10\% & 1.52\% & 23.38\% & 146.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These results show that increasing \(\alpha\) can improve TIR at 3 and 5 minutes, but the
+policy becomes more aggressive and may increase hypoglycemia risk at 1 minute. The current
+best stable setting is therefore \(\alpha=1.25\), although the TIR improvement is more
+conservative than the more aggressive settings.
+
+\section{Current Interpretation and Next Direction}
+
+Complete PhiBE improves TIR across all three evaluation intervals, especially at 3 and
+5 minutes, but the improvement comes with slightly higher TBR. The current interpretation
+is that the Hessian/diffusion term changes the critic shape in a way that encourages a more
+aggressive insulin policy. This is useful for reducing hyperglycemia, but it can also push
+glucose too low when actions are applied more frequently.
+
+The next research question is whether the project should focus on reducing the mild TBR
+increase while keeping the TIR gain, or whether another direction should be prioritized
+first. A natural next experiment is a safety-aware Complete PhiBE objective that increases
+the penalty near or below the hypoglycemia threshold, while keeping the second-order
+continuous-time regularization.
+
+\section{Reproducibility Notes}
+
+The current codebase keeps the original 3-minute training replay construction. The main
+commands are:
+\begin{verbatim}
+python run_emerson2023_td3bc_reproduction.py \
+  --patients adult#1 --train-seeds 0,1,2 --test-seeds 0,1,2 \
+  --replay-length 100000 --training-timesteps 100000
+
+python run_stage1_phibe_adult1.py \
+  --train-seed 0 --training-timesteps 100000 --num-train-steps 70000 \
+  --phibe-mode full_second_order --lambda-phibe 0.01 --alpha 1.25 \
+  --save-tag phibe_stage4_full_second_order_lam1e-2_norm_alpha1p25
+
+python eval_multidt_stage2.py \
+  --train-seeds 0,1,2 --test-seeds 0,1,2 --dts 1,3,5 \
+  --phibe-mode full_second_order --lambda-phibe 0.01 --alpha 1.25
+\end{verbatim}
+
+\begin{thebibliography}{9}
+
+\bibitem{emerson2023}
+H. Emerson, M. J. Guy, and R. McConville.
+\newblock Offline Reinforcement Learning for Safer Blood Glucose Control in People with Type 1 Diabetes.
+\newblock \emph{Journal of Biomedical Informatics}, 142:104376, 2023.
+\newblock doi: \href{https://doi.org/10.1016/j.jbi.2023.104376}{10.1016/j.jbi.2023.104376}.
+
+\end{thebibliography}
+
+\end{document}

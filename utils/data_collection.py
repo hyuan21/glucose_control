@@ -143,6 +143,7 @@ def fill_replay(
             # select the basal dose ------------------------------------------
             
             # calculate the OU noise from the initial parameters 
+            ou_noise = 0
             if noise:
                 ou_noise = (prev_ou_noise + theta * (0 - prev_ou_noise) * dt + sigma * np.sqrt(dt) * np.random.normal(size=(1,))[0])
                 ou_noise = ou_noise * basal_default

@@ -167,6 +167,15 @@ Models/
 # PID demonstrator replay buffer -- regeneratable from cell 3 of Comparison_CT.ipynb
 Replays/
 
+# Generated experiment outputs. Keep only curated final CSVs in the repository.
+Results/*
+!Results/README.md
+!Results/final_*.csv
+Figures/*
+!Figures/README.md
+!Figures/final_*.png
+!Figures/final_*.pdf
+
 # Mid-term report (kept locally, not in repo)
 *中期报告*.docx
 *-CT-Report-*.docx
